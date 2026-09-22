@@ -1,0 +1,17 @@
+[package]
+name = "gridski"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+quick-xml = "0.42.0"
+rmcp = { version = "3.4.0", features = ["server", "transport-io", "macros"] }
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "io-std", "process", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
