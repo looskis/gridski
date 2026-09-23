@@ -28,6 +28,9 @@ pub enum BridgeError {
     Busy,
     #[error("{0}")]
     NotFound(String),
+    /// Excel accepted a save but the file wasn't there when checked; it may still land.
+    #[error("{0}")]
+    NotWritten(String),
     #[error("{0}")]
     Unsupported(String),
     #[error("{0}")]

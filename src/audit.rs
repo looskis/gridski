@@ -22,10 +22,16 @@ pub struct AuditOutput {
     pub sheet: String,
     pub address: String,
     pub formula_cells: usize,
+    /// Set when cells went unexamined or findings were left out; `note` says which.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated: Option<String>,
+    pub note: Option<String>,
+    /// Flagged row blocks, counting every row folded into `same_rows`.
+    pub inconsistent_rows_total: usize,
     /// Rows where formulas change pattern, or constants sit between formulas.
     pub inconsistent_rows: Vec<RowFinding>,
+    pub embedded_numbers_total: usize,
     /// Formulas with numbers typed in, grouped by identical R1C1 pattern.
     pub embedded_numbers: Vec<EmbeddedNumbers>,
 }
@@ -35,6 +41,10 @@ pub struct RowFinding {
     pub row: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Other rows whose runs have exactly this shape (same columns, same R1C1 patterns),
+    /// e.g. "12-20, 31"; `runs` shows this row's formulas only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_rows: Option<String>,
     /// Consecutive cells sharing one formula pattern, in column order.
     pub runs: Vec<Run>,
     /// Cells holding typed values between the row's first and last formula.
@@ -58,14 +68,25 @@ pub struct EmbeddedNumbers {
     pub numbers: Vec<String>,
 }
 
-pub fn audit(workbook: String, sheet: String, address: &str, a1: &[Vec<Value>], r1c1: &[Vec<Value>]) -> AuditOutput {
+/// Audit a block of formulas (A1 and R1C1 text, row by row), listing at most
+/// `max_findings` inconsistent rows and `max_findings` embedded-number groups.
+pub fn audit(
+    workbook: String,
+    sheet: String,
+    address: &str,
+    a1: &[Vec<Value>],
+    r1c1: &[Vec<Value>],
+    max_findings: usize,
+) -> AuditOutput {
     let address = address.replace('$', "");
     let (top, left) = top_left(&address).unwrap_or((1, 1));
     let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
     let is_formula = |s: &str| s.starts_with('=');
 
     let mut formula_cells = 0;
-    let mut inconsistent_rows = Vec::new();
+    // Findings keyed by shape, so rows copied down from one another collapse into one.
+    let mut inconsistent: Vec<(String, RowFinding, Vec<u32>)> = Vec::new();
+    let mut inconsistent_total = 0;
     let mut embedded: Vec<(String, EmbeddedNumbers)> = Vec::new();
 
     for (ri, (row_a1, row_r1c1)) in a1.iter().zip(r1c1).enumerate() {
@@ -100,26 +121,67 @@ pub fn audit(workbook: String, sheet: String, address: &str, a1: &[Vec<Value>], 
             .find(|(_, f, _)| !f.is_empty() && !is_formula(f) && f.parse::<f64>().is_err())
             .map(|(_, f, _)| f.clone());
         for block in cells.split(|(_, f, _)| f.is_empty()) {
-            if let Some(finding) = judge_block(row, block, label.clone()) {
-                inconsistent_rows.push(finding);
+            if let Some((shape, finding)) = judge_block(row, block, label.clone()) {
+                inconsistent_total += 1;
+                match inconsistent.iter_mut().find(|(s, _, _)| *s == shape) {
+                    Some((_, _, rows)) => rows.push(row),
+                    None => inconsistent.push((shape, finding, Vec::new())),
+                }
             }
         }
     }
 
+    let (inconsistent_groups, embedded_total) = (inconsistent.len(), embedded.len());
+    let inconsistent_rows: Vec<RowFinding> = inconsistent
+        .into_iter()
+        .take(max_findings)
+        .map(|(_, mut finding, rows)| {
+            finding.same_rows = (!rows.is_empty()).then(|| row_list(&rows));
+            finding
+        })
+        .collect();
+    embedded.truncate(max_findings);
+    let truncated = inconsistent_groups > max_findings || embedded_total > max_findings;
     AuditOutput {
         workbook,
         sheet,
         address,
         formula_cells,
-        truncated: None,
+        truncated,
+        note: truncated.then(|| {
+            format!(
+                "Listed {} of {inconsistent_groups} inconsistent-row groups and {} of {embedded_total} embedded-number \
+                 groups; narrow range or raise max_findings to see the rest.",
+                inconsistent_rows.len(),
+                embedded.len()
+            )
+        }),
+        inconsistent_rows_total: inconsistent_total,
         inconsistent_rows,
+        embedded_numbers_total: embedded_total,
         embedded_numbers: embedded.into_iter().map(|(_, e)| e).collect(),
     }
 }
 
+/// Compact row numbers: [3, 4, 5, 9] → "3-5, 9".
+fn row_list(rows: &[u32]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let mut j = i;
+        while j + 1 < rows.len() && rows[j + 1] == rows[j] + 1 {
+            j += 1;
+        }
+        parts.push(if i == j { rows[i].to_string() } else { format!("{}-{}", rows[i], rows[j]) });
+        i = j + 1;
+    }
+    parts.join(", ")
+}
+
 /// Judge one contiguous block of non-blank cells in a row: flag it when its formulas
-/// change pattern or typed values sit between them.
-fn judge_block(row: u32, block: &[(u32, String, String)], label: Option<String>) -> Option<RowFinding> {
+/// change pattern or typed values sit between them. Also returns the finding's shape
+/// (run columns and R1C1 patterns, constant columns), which rows copied down share.
+fn judge_block(row: u32, block: &[(u32, String, String)], label: Option<String>) -> Option<(String, RowFinding)> {
     let is_formula = |s: &str| s.starts_with('=');
     let formulas: Vec<&(u32, String, String)> = block.iter().filter(|(_, f, _)| is_formula(f)).collect();
     if formulas.len() < MIN_SERIES {
@@ -133,17 +195,21 @@ fn judge_block(row: u32, block: &[(u32, String, String)], label: Option<String>)
             _ => runs.push((*col, *col, r, f)),
         }
     }
-    let constants: Vec<String> = block
+    let constant_cols: Vec<u32> = block
         .iter()
         .filter(|(col, f, _)| *col > first && *col < last && !is_formula(f))
-        .map(|(col, _, _)| cell_address(row, *col))
+        .map(|(col, _, _)| *col)
         .collect();
     let mut patterns: Vec<&str> = runs.iter().map(|r| r.2).collect();
     patterns.sort_unstable();
     patterns.dedup();
-    if patterns.len() == 1 && constants.is_empty() {
+    if patterns.len() == 1 && constant_cols.is_empty() {
         return None;
     }
+    let mut shape: String =
+        runs.iter().map(|(start, end, pattern, _)| format!("{start}-{end}{pattern}\u{1f}")).collect();
+    shape.extend(constant_cols.iter().map(|col| format!("c{col}\u{1f}")));
+    let constants = constant_cols.iter().map(|col| cell_address(row, *col)).collect();
     let runs = runs
         .into_iter()
         .map(|(start, end, _, f)| Run {
@@ -155,7 +221,7 @@ fn judge_block(row: u32, block: &[(u32, String, String)], label: Option<String>)
             formula: f.to_string(),
         })
         .collect();
-    Some(RowFinding { row, label, runs, constants })
+    Some((shape, RowFinding { row, label, same_rows: None, runs, constants }))
 }
 
 
@@ -230,7 +296,7 @@ mod tests {
     fn flags_broken_series() {
         let a1 = vec![vec![json!("Rent"), json!("=100"), json!("=C1"), json!("=D1*1.02"), json!("=E1"), json!("7"), json!("=G1")]];
         let r1c1 = vec![vec![json!("Rent"), json!("=100"), json!("=RC[-1]"), json!("=RC[-1]*1.02"), json!("=RC[-1]"), json!("7"), json!("=RC[-1]")]];
-        let out = audit("wb".into(), "s".into(), "$A$1:$G$1", &a1, &r1c1);
+        let out = audit("wb".into(), "s".into(), "$A$1:$G$1", &a1, &r1c1, 50);
         assert_eq!(out.formula_cells, 5);
         let row = &out.inconsistent_rows[0];
         assert_eq!(row.label.as_deref(), Some("Rent"));
@@ -245,7 +311,7 @@ mod tests {
     fn consistent_series_passes() {
         let a1 = vec![vec![json!("=A1+1"), json!("=B1+1"), json!("=C1+1")]];
         let r1c1 = vec![vec![json!("=RC[-1]+1"), json!("=RC[-1]+1"), json!("=RC[-1]+1")]];
-        let out = audit("wb".into(), "s".into(), "B1:D1", &a1, &r1c1);
+        let out = audit("wb".into(), "s".into(), "B1:D1", &a1, &r1c1, 50);
         assert!(out.inconsistent_rows.is_empty() && out.embedded_numbers.is_empty());
     }
 
@@ -260,11 +326,39 @@ mod tests {
             vec![json!("NOI"), json!("=SUM(RC[2]:RC[4])"), json!(""), json!("=R[1]C[-3]"), json!("=R[1]C[-3]"), json!("=R[1]C[-3]")],
             vec![json!("Tax"), json!("=SUM(RC[2]:RC[4])"), json!(""), json!("=R[1]C[-3]"), json!("=R[1]C[-3]*2"), json!("=R[1]C[-3]")],
         ];
-        let out = audit("wb".into(), "s".into(), "B1:G2", &a1, &r1c1);
+        let out = audit("wb".into(), "s".into(), "B1:G2", &a1, &r1c1, 50);
         assert_eq!(out.inconsistent_rows.len(), 1);
         let row = &out.inconsistent_rows[0];
         assert_eq!((row.row, row.label.as_deref()), (2, Some("Tax")));
         let ranges: Vec<_> = row.runs.iter().map(|r| r.range.as_str()).collect();
         assert_eq!(ranges, ["E2", "F2", "G2"]);
+    }
+
+    #[test]
+    fn collapses_copied_rows_and_caps_findings() {
+        // Rows 1-3 break the same way (copied down); row 4 breaks differently.
+        let a1: Vec<Vec<Value>> = (1..=4)
+            .map(|r| vec![json!(format!("=A{r}")), json!(format!("=B{r}*2")), json!(format!("=C{r}"))])
+            .collect();
+        let mut r1c1: Vec<Vec<Value>> =
+            (1..=3).map(|_| vec![json!("=RC[-1]"), json!("=RC[-1]*2"), json!("=RC[-1]")]).collect();
+        r1c1.push(vec![json!("=RC[-1]*2"), json!("=RC[-1]"), json!("=RC[-1]")]);
+
+        let out = audit("wb".into(), "s".into(), "B1:D4", &a1, &r1c1, 50);
+        assert_eq!(out.inconsistent_rows_total, 4);
+        let rows: Vec<_> = out.inconsistent_rows.iter().map(|f| (f.row, f.same_rows.as_deref())).collect();
+        assert_eq!(rows, [(1, Some("2-3")), (4, None)]);
+        assert_eq!(out.embedded_numbers_total, 2);
+        assert!(!out.truncated);
+
+        let out = audit("wb".into(), "s".into(), "B1:D4", &a1, &r1c1, 1);
+        assert_eq!((out.inconsistent_rows.len(), out.embedded_numbers.len()), (1, 1));
+        assert_eq!((out.inconsistent_rows_total, out.embedded_numbers_total), (4, 2));
+        assert!(out.truncated && out.note.is_some());
+    }
+
+    #[test]
+    fn row_lists_compact() {
+        assert_eq!(row_list(&[3, 4, 5, 9, 11, 12]), "3-5, 9, 11-12");
     }
 }

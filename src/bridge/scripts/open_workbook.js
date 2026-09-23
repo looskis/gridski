@@ -1,15 +1,17 @@
 respond(() => {
   const excel = excelApp();
-  if (!ARGS.path) return workbookInfo(excel, excel.make({ new: "workbook" }));
+  if (!ARGS.path) {
+    // make() returns a positional reference that follows whichever workbook is frontmost;
+    // pin it by name before anything else can change the order.
+    const name = excel.make({ new: "workbook" }).name();
+    return workbookInfo(excel, excel.workbooks[name]);
+  }
 
   const path = ARGS.path;
   const name = path.split("/").pop();
-  const open = excel.workbooks().find((wb) => wb.name() === name);
-  if (open) {
-    // Excel can't hold two workbooks with the same file name.
-    if (open.fullName() === path) return workbookInfo(excel, open);
-    throw new GridskiError("UNSUPPORTED", `A different "${name}" is already open (${open.fullName()}); close it first.`);
-  }
+  const open = excel.workbooks().find((wb) => wb.fullName() === path);
+  if (open) return workbookInfo(excel, open);
+  refuseNameClash(excel, path);
   if (fileMtime(path) === null) throw new GridskiError("NOT_FOUND", `No file at ${path}.`);
   // Open with macros force-disabled: Excel's "enable macros?" prompt is modal and would
   // block every later call. Links are not updated, which would prompt too.

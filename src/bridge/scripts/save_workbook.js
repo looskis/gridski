@@ -22,13 +22,14 @@ respond(() => {
     if (before !== null && !ARGS.overwrite) {
       throw new GridskiError("INVALID", `${path} already exists; pass overwrite: true to replace it.`);
     }
+    refuseNameClash(excel, path, current);
     excelScript(`save workbook as workbook ${asq(wb.name())} filename ${asq(path)} file format ${FORMATS[ext]}`);
   }
   // Folders Excel hasn't been granted access to fail the same silent way; verify the write.
   const after = fileMtime(path);
   if (after === null || (before !== null && after === before)) {
     throw new GridskiError(
-      "UNSUPPORTED",
+      "NOT_WRITTEN",
       `Excel reported saving but ${path} was not written; Excel may lack access to that folder. ` +
         "Grant Excel access to the workspace folder when it asks, then save again."
     );

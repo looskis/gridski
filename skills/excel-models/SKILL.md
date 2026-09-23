@@ -47,7 +47,14 @@ Work in this order, because each step explains the next:
 Comparison is in R1C1, so a formula copied correctly across every period reads
 identically; anything that differs broke the pattern. Each row comes back as `runs` —
 consecutive cells sharing a pattern, with the first cell's formula — plus `constants`,
-typed values sitting between formulas.
+typed values sitting between formulas. Rows broken in exactly the same way (rows copied
+down from one another) are folded into one finding, with the others listed in
+`same_rows`.
+
+Each list is capped by `max_findings` (default 50). `inconsistent_rows_total` and
+`embedded_numbers_total` give the full counts, and `truncated` is set when something was
+left out: audit a narrower `range` (one block of a stacked sheet at a time) rather than
+raising the cap by much.
 
 **These are leads, not defects.** A first period that differs from the rest is usually
 legitimate (an opening balance, a stub period). A run that changes two thirds of the way
@@ -157,6 +164,12 @@ prompts again.
 
 If a call reports that Excel is busy or did not respond, a dialog is probably open on
 screen. Ask the user to look at Excel rather than retrying.
+
+A save-as into a new folder can be slow. `save_workbook` waits for the file and reports
+`saved late` when it lands; if it still errors, Excel may already show the workbook under
+its new name with the file yet to appear, so check for the file before saving again.
+Excel can't hold two workbooks with the same file name (`source.xlsx` from two folders):
+close one first.
 
 ## Not available
 

@@ -13,11 +13,11 @@ It talks to the running Excel app through Apple Events (JavaScript for Automatio
 | `read_range` | Values and formulas from a range (defaults to the active sheet's used range) |
 | `write_range` | Write a grid of values/formulas; returns the previous contents so it can be reverted |
 | `list_names` | Defined names and what each refers to |
-| `audit_formulas` | Rows whose formula changes across columns (compared in R1C1), and numbers typed into formulas |
+| `audit_formulas` | Rows whose formula changes across columns (compared in R1C1), and numbers typed into formulas; rows broken the same way are folded together, and each list is capped by `max_findings` (default 50) with full totals |
 | `read_formats` | Font color, bold/italic, fill, number format, and borders as merged rectangles; reads the saved file when there are no unsaved changes |
-| `open_workbook` | Open a file inside the workspace (macros disabled, links not updated), or create a blank workbook |
-| `save_workbook` | Save in place or save as a new file inside the workspace; verifies the file was written |
-| `close_workbook` | Close a workbook, saving or discarding changes |
+| `open_workbook` | Open a file inside the workspace (macros disabled, links not updated), or create a blank workbook; refuses a file name that a different open workbook already has |
+| `save_workbook` | Save in place or save as a new file inside the workspace (creating folders); verifies the file was written, waiting up to 60 s more when Excel is slow, and refuses a file name another open workbook has |
+| `close_workbook` | Close a workbook, saving or discarding changes; errors if Excel leaves it open |
 | `manage_sheet` | Add, rename, move, or delete a worksheet |
 | `define_name` | Create, change, or remove a workbook-level name |
 | `build_rows` | Build a period sheet's rows in one call: label, units, total, and a first-period formula filled across all periods; rows refer to each other by `{key}`; styles and number formats applied |
@@ -60,6 +60,8 @@ gridski never launches Excel; it reports an error if Excel isn't running.
 Excel is sandboxed: the first time it opens or saves in a new folder it shows a modal "Grant File Access" dialog, which blocks every Apple Event until someone answers it, and outside granted folders it can report a save that never reached disk. So gridski opens and saves files only inside one workspace folder, set with `GRIDSKI_ROOT` (default `~/gridski`, created if missing). Paths in tool calls are relative to it; anything outside is refused before Excel sees it.
 
 The first save into the workspace may prompt once: choose the workspace folder itself in the dialog, and the grant covers saving anywhere beneath it. Opening is different: Excel asks once for every file it didn't create itself (a download, a copy made by another program), even inside a granted folder. To ask only once per file, open it and `save_workbook` it to a new path — Excel's own saved copy never prompts again.
+
+Excel can't hold two workbooks with the same file name, even from different folders, so `open_workbook` and `save_workbook` refuse one that's already taken rather than let Excel fail with a bare "Parameter error". A save-as into a folder Excel hasn't written to before can take long enough to outlast the 30 s call timeout, or land after Excel reports it done; `save_workbook` then keeps watching for the file and reports `"note": "saved late …"` once it appears.
 
 ```json
 { "gridski": { "command": "/path/to/gridski", "env": { "GRIDSKI_ROOT": "~/models" } } }

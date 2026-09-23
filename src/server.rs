@@ -2,6 +2,7 @@
 
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -25,6 +26,12 @@ const MAX_WRITE_CELLS: usize = 10_000;
 /// Leaves headroom under the bridge's 30 s timeout for the live format reader.
 const LIVE_FORMAT_BUDGET_MS: u64 = 20_000;
 const MAX_FORMAT_BLOCKS: usize = 2_000;
+const DEFAULT_MAX_FINDINGS: usize = 50;
+const MAX_FINDINGS: usize = 1_000;
+/// How long save_workbook keeps watching for the file after Excel stops responding.
+const LATE_SAVE_WINDOW: Duration = Duration::from_secs(60);
+const LATE_SAVE_POLL: Duration = Duration::from_millis(500);
+const LATE_SAVE_CONFIRM: Duration = Duration::from_secs(10);
 
 const INSTRUCTIONS: &str = "Reads, audits, and builds workbooks in Microsoft Excel on this Mac, \
 which must already be running. Start with get_selection to see what the user is looking at, \
@@ -212,6 +219,8 @@ pub struct AuditFormulasParams {
     pub range: Option<String>,
     /// Maximum cells to examine (default and max 20000).
     pub max_cells: Option<usize>,
+    /// Most inconsistent-row groups and embedded-number groups to list, each (default 50, max 1000).
+    pub max_findings: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -348,7 +357,7 @@ impl<B: ExcelBridge> GridskiServer<B> {
     }
 
     #[tool(
-        description = "Open an .xlsx/.xlsm file in Excel, or create a new blank workbook when no path is given. Returns the workbook's name (use it as `workbook` in other tools) and sheets. A file that is already open is returned as is. Macros are disabled and external links are not updated, so neither prompts. Excel asks once for access to a file it did not create; save_workbook a copy into the workspace to avoid asking again.",
+        description = "Open an .xlsx/.xlsm file in Excel, or create a new blank workbook when no path is given. Returns the workbook's name (use it as `workbook` in other tools) and sheets. A file that is already open is returned as is; a different open workbook with the same file name is refused, since Excel can't hold both. Macros are disabled and external links are not updated, so neither prompts. Excel asks once for access to a file it did not create; save_workbook a copy into the workspace to avoid asking again.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true)
     )]
     async fn open_workbook(&self, Parameters(p): Parameters<OpenWorkbookParams>) -> Result<CallToolResult, McpError> {
@@ -361,7 +370,7 @@ impl<B: ExcelBridge> GridskiServer<B> {
     }
 
     #[tool(
-        description = "Save a workbook in place, or save it as a new file when path is given (the workbook then takes the new file's name). Refuses to replace an existing file unless overwrite is true. Excel can only write where it has folder access (your home folder, not /tmp); the tool checks the file was actually written.",
+        description = "Save a workbook in place, or save it as a new file when path is given (the workbook then takes the new file's name). Creates missing folders; refuses to replace an existing file unless overwrite is true, and refuses a file name another open workbook already has. Excel can only write where it has folder access (your home folder, not /tmp); the tool checks the file was actually written, and if Excel is slow it keeps watching for up to 60 s and reports a late save in note.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true)
     )]
     async fn save_workbook(&self, Parameters(p): Parameters<SaveWorkbookParams>) -> Result<CallToolResult, McpError> {
@@ -369,22 +378,48 @@ impl<B: ExcelBridge> GridskiServer<B> {
             Ok(path) => path,
             Err(e) => return respond::<()>(Err(e)),
         };
+        // Excel can't create folders: a save-as into a missing one fails with "Parameter error"
+        // yet still renames the workbook to the unwritten path. The path is inside the workspace.
+        if let Some(parent) = path.as_deref().and_then(|p| std::path::Path::new(p).parent())
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return respond::<()>(Err(BridgeError::InvalidInput(format!("Could not create {}: {e}", parent.display()))));
+        }
+        // Where the file will land, so a save that outlives the bridge's timeout can still be confirmed.
+        let target = match &path {
+            Some(path) => Some(path.clone()),
+            None => self.workbook_path(p.workbook.as_deref()).await,
+        };
+        let before = target.as_deref().and_then(file_stamp);
         let args = serde_json::json!({
             "workbook": p.workbook,
             "path": path,
             "root": self.root.to_string_lossy(),
             "overwrite": p.overwrite.unwrap_or(false),
         });
-        respond(self.bridge.call::<_, Value>(Script::SaveWorkbook, &args).await)
+        let save_as = path.is_some();
+        match (self.bridge.call::<_, Value>(Script::SaveWorkbook, &args).await, target) {
+            (Err(BridgeError::Busy), Some(target)) => respond(self.late_save(target, before).await),
+            // The file of a save-as can appear after Excel reports the save done.
+            (Err(BridgeError::NotWritten(_)), Some(target)) if save_as => respond(self.late_save(target, before).await),
+            (result, _) => respond(result),
+        }
     }
 
     #[tool(
-        description = "Close a workbook. save: true saves it first; save: false discards unsaved changes.",
+        description = "Close a workbook. save: true saves it first; save: false discards unsaved changes. Errors if the workbook is still open afterwards (Excel busy or showing a dialog).",
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false)
     )]
     async fn close_workbook(&self, Parameters(p): Parameters<CloseWorkbookParams>) -> Result<CallToolResult, McpError> {
         let args = serde_json::json!({ "workbook": p.workbook, "save": p.save });
-        respond(self.bridge.call::<_, Value>(Script::CloseWorkbook, &args).await)
+        respond(self.bridge.call::<_, Value>(Script::CloseWorkbook, &args).await.map_err(|e| match e {
+            BridgeError::Busy => BridgeError::Unsupported(format!(
+                "Excel did not respond while closing \"{}\", so it may still be open; it is probably busy or \
+                 showing a dialog. Ask the user to check Excel, then confirm with list_workbooks.",
+                p.workbook
+            )),
+            other => other,
+        }))
     }
 
     #[tool(
@@ -488,7 +523,7 @@ impl<B: ExcelBridge> GridskiServer<B> {
     }
 
     #[tool(
-        description = "Audit a sheet's formulas. inconsistent_rows: rows with 3+ formulas whose formula changes along the row (compared in R1C1, so a correctly copied formula matches in every column) or with typed values between formulas; a blank cell splits a row into blocks judged separately, so a totals column set off by a blank spacer is not flagged; each lists its runs with the first cell's formula. embedded_numbers: formulas containing typed numbers other than 0, 1 and 12, grouped by pattern. A different first-period formula is often legitimate; judge each finding.",
+        description = "Audit a sheet's formulas. inconsistent_rows: rows with 3+ formulas whose formula changes along the row (compared in R1C1, so a correctly copied formula matches in every column) or with typed values between formulas; a blank cell splits a row into blocks judged separately, so a totals column set off by a blank spacer is not flagged; each lists its runs with the first cell's formula. Rows with identical runs (same columns and R1C1 patterns) are folded into one finding's same_rows. embedded_numbers: formulas containing typed numbers other than 0, 1 and 12, grouped by pattern. Each list is capped at max_findings (default 50); *_total give the full counts and truncated is set when anything was left out. A different first-period formula is often legitimate; judge each finding.",
         annotations(read_only_hint = true)
     )]
     async fn audit_formulas(&self, Parameters(p): Parameters<AuditFormulasParams>) -> Result<CallToolResult, McpError> {
@@ -498,13 +533,21 @@ impl<B: ExcelBridge> GridskiServer<B> {
             "range": p.range,
             "max_cells": p.max_cells.unwrap_or(MAX_READ_CELLS).clamp(1, MAX_READ_CELLS),
         });
+        let max_findings = p.max_findings.unwrap_or(DEFAULT_MAX_FINDINGS).clamp(1, MAX_FINDINGS);
         let result = self.bridge.call::<_, RawFormulas>(Script::AuditFormulas, &args).await.map(|raw| {
-            let mut out = audit::audit(raw.workbook, raw.sheet, &raw.address, &raw.formulas, &raw.r1c1);
+            let mut out = audit::audit(raw.workbook, raw.sheet, &raw.address, &raw.formulas, &raw.r1c1, max_findings);
             let returned = raw.formulas.len() * raw.formulas.first().map_or(0, Vec::len);
-            out.truncated = (returned < raw.total_rows * raw.total_cols).then(|| format!(
-                "Only {} of {}x{} cells were examined; audit the rest with a narrower range.",
-                out.address, raw.total_rows, raw.total_cols
-            ));
+            if returned < raw.total_rows * raw.total_cols {
+                let cells = format!(
+                    "Only {} of {}x{} cells were examined; audit the rest with a narrower range.",
+                    out.address, raw.total_rows, raw.total_cols
+                );
+                out.note = Some(match out.note.take() {
+                    Some(findings) => format!("{cells} {findings}"),
+                    None => cells,
+                });
+                out.truncated = true;
+            }
             out
         });
         respond(result)
@@ -536,6 +579,59 @@ impl<B: ExcelBridge> GridskiServer<B> {
             )));
         }
         Ok(normal.to_string_lossy().into_owned())
+    }
+
+    /// The saved file behind a workbook (by name, or the active one), if it has one.
+    async fn workbook_path(&self, workbook: Option<&str>) -> Option<String> {
+        let books = self.bridge.list_workbooks().await.ok()?;
+        let book = books.into_iter().find(|b| workbook.map_or(b.active, |name| b.name == name))?;
+        book.path.starts_with('/').then_some(book.path)
+    }
+
+    /// Excel sometimes finishes a save well after the bridge gave up on it (a first save into a
+    /// new folder, a large workbook). Wait for the file to land before calling it a failure.
+    async fn late_save(&self, target: String, before: Option<FileStamp>) -> Result<Value, BridgeError> {
+        tracing::info!(%target, "save not confirmed; watching for the file");
+        if !wait_for_write(&target, before, LATE_SAVE_WINDOW, LATE_SAVE_POLL).await {
+            let waited = LATE_SAVE_WINDOW.as_secs();
+            // Excel can rename the workbook to the new path (and call it saved) well before the
+            // file appears; it has been seen landing minutes later.
+            return Err(BridgeError::Unsupported(match self.open_at(&target).await {
+                Some(book) => format!(
+                    "Excel did not confirm the save. It already shows the workbook as \"{}\" at {target}, but the \
+                     file had not appeared after a further {waited} s; Excel may still be writing it. Check for the \
+                     file before saving again, and don't save it under another name meanwhile.",
+                    book.name
+                ),
+                None => format!(
+                    "Excel did not confirm the save, and {target} was not written within a further {waited} s. \
+                     Excel may be showing a dialog (such as a file-access prompt), be stuck, or lack access to \
+                     the folder; ask the user to check Excel."
+                ),
+            }));
+        }
+        let name = target.rsplit('/').next().unwrap_or(&target).to_string();
+        // Best effort: Excel is usually responsive again once the file is down.
+        Ok(match self.open_at(&target).await {
+            Some(book) => serde_json::json!({
+                "workbook": book.name,
+                "path": book.path,
+                "saved": book.saved,
+                "note": "saved late (Excel was slow to respond)",
+            }),
+            None => serde_json::json!({
+                "workbook": name,
+                "path": target,
+                "note": "saved late (Excel was slow to respond); the file is written, but Excel has not yet \
+                         confirmed the workbook under its new name — check list_workbooks",
+            }),
+        })
+    }
+
+    /// The open workbook whose file is `path`, if Excel answers promptly.
+    async fn open_at(&self, path: &str) -> Option<WorkbookInfo> {
+        let books = tokio::time::timeout(LATE_SAVE_CONFIRM, self.bridge.list_workbooks()).await.ok()?.ok()?;
+        books.into_iter().find(|b| b.path == path)
     }
 
     async fn read_formats_inner(&self, p: SheetRangeParams) -> Result<FormatsOutput, BridgeError> {
@@ -575,6 +671,32 @@ impl<B: ExcelBridge> GridskiServer<B> {
             blocks: formats::blocks_from_live(live.blocks),
             unread: live.unread.iter().map(|a| cells::strip_dollars(a)).collect(),
         }))
+    }
+}
+
+/// A file's modification time and size, to tell whether a save rewrote it.
+type FileStamp = (std::time::SystemTime, u64);
+
+fn file_stamp(path: &str) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// Poll until `path` holds a non-empty file that differs from `before` and has stopped
+/// changing between two polls, or until `window` runs out.
+async fn wait_for_write(path: &str, before: Option<FileStamp>, window: Duration, poll: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut last: Option<FileStamp> = None;
+    loop {
+        let now = file_stamp(path).filter(|stamp| stamp.1 > 0 && Some(*stamp) != before);
+        if now.is_some() && now == last {
+            return true;
+        }
+        last = now;
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
     }
 }
 
@@ -672,6 +794,34 @@ mod tests {
         assert!(server.resolve("../elsewhere.xlsx").is_err());
         assert!(server.resolve("/private/tmp/x.xlsx").is_err());
         assert!(server.resolve("/Users/me/workshop/x.xlsx").is_err());
+    }
+
+    #[tokio::test]
+    async fn late_save_waits_for_the_file() {
+        let dir = std::env::temp_dir().join(format!("gridski-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("late.xlsx");
+        let path_str = path.to_string_lossy().into_owned();
+        let poll = Duration::from_millis(20);
+
+        // Never written: gives up when the window closes.
+        assert!(!wait_for_write(&path_str, None, Duration::from_millis(100), poll).await);
+
+        // Written partway through the window.
+        let writer = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                std::fs::write(&path, b"PK").unwrap();
+            })
+        };
+        assert!(wait_for_write(&path_str, None, Duration::from_secs(2), poll).await);
+        writer.await.unwrap();
+
+        // An existing file that is not rewritten does not count as saved.
+        let before = file_stamp(&path_str);
+        assert!(!wait_for_write(&path_str, before, Duration::from_millis(100), poll).await);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

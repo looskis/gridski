@@ -136,6 +136,7 @@ fn classify(number: Option<i64>, code: Option<&str>, message: String) -> BridgeE
     match (code, number) {
         (Some("NOT_RUNNING"), _) | (_, Some(ERR_APP_NOT_RUNNING)) => BridgeError::NotRunning,
         (Some("NOT_FOUND"), _) => BridgeError::NotFound(message),
+        (Some("NOT_WRITTEN"), _) => BridgeError::NotWritten(message),
         (Some("UNSUPPORTED"), _) => BridgeError::Unsupported(message),
         (Some("INVALID"), _) => BridgeError::InvalidInput(message),
         (_, Some(ERR_NOT_AUTHORIZED)) => BridgeError::PermissionDenied,

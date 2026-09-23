@@ -165,6 +165,21 @@ function workbookInfo(excel, wb) {
   };
 }
 
+// Excel can't hold two workbooks with the same file name (compared without case), even
+// from different folders; opening or saving as one fails with a bare "Parameter error".
+// `self` is the full name of the workbook being saved, which may keep its own name.
+function refuseNameClash(excel, path, self) {
+  const name = path.split("/").pop().toLowerCase();
+  const clash = excel.workbooks().find((wb) => wb.name().toLowerCase() === name && wb.fullName() !== self);
+  if (clash) {
+    throw new GridskiError(
+      "UNSUPPORTED",
+      `A workbook named ${clash.name()} is already open (${clash.fullName()}). Close it first — ` +
+        "Excel can't hold two workbooks with the same name."
+    );
+  }
+}
+
 function resolveWorkbook(excel, name) {
   return resolveSheet(excel, { workbook: name }).wb;
 }
