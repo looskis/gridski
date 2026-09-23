@@ -26,20 +26,13 @@ const MAX_WRITE_CELLS: usize = 10_000;
 const LIVE_FORMAT_BUDGET_MS: u64 = 20_000;
 const MAX_FORMAT_BLOCKS: usize = 2_000;
 
-const INSTRUCTIONS: &str = "Reads, audits, and builds workbooks in Microsoft Excel on this Mac. \
-Start with get_selection to see what the user is looking at, or list_workbooks to see what's open. \
-Workbook and sheet default to whatever is active in Excel. \
-To review a model: read_range for values and formulas, list_names for defined names, \
-audit_formulas for rows whose formula changes across periods and numbers typed into formulas, \
-read_formats for input/formula color coding. \
-To build one: open_workbook, manage_sheet, define_name for inputs, then build_rows for each period sheet \
-(label, units, total and first-period formula per row, referring to other rows by {key}; it fills every period and formats), \
-write_range and format_range for everything else, save_workbook. \
+const INSTRUCTIONS: &str = "Reads, audits, and builds workbooks in Microsoft Excel on this Mac, \
+which must already be running. Start with get_selection to see what the user is looking at, \
+or list_workbooks to see what's open; workbook and sheet default to whatever is active. \
 Files are opened and saved only inside the workspace folder; pass paths relative to it. \
-Excel asks the user once for access to any file it did not create itself, even inside the workspace, \
-so open a downloaded file once and save_workbook a copy to work from. Workbooks open with macros disabled. \
 Edits change the user's live workbook and cannot be undone with Excel's Undo; \
-write_range returns the previous contents so you can restore them.";
+write_range and fill_right return the previous contents so you can restore them. \
+The excel-models skill covers reviewing and building models with these tools.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadRangeParams {

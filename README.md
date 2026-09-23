@@ -24,6 +24,12 @@ It talks to the running Excel app through Apple Events (JavaScript for Automatio
 | `fill_right` | Copy each row's first cell across a range, like Excel's Fill Right; for time-series rows |
 | `format_range` | Set font color, bold/italic, fill, number format, alignment, indent, column width, and borders |
 
+## Skill
+
+`skills/excel-models/SKILL.md` carries the judgment the tool descriptions can't: how to review a
+model, how to lay out a period sheet, the color conventions, and Excel's file-access behavior.
+Load it into a client alongside the server; the server's own instructions stay limited to routing.
+
 Results are normalized for models: empty cells are `null`, dates are `YYYY-MM-DD`, errors are codes like `#DIV/0!`, formulas are listed sparsely by cell, and large reads are truncated with a `next_range` to continue from.
 
 ## Build
