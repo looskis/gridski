@@ -130,6 +130,7 @@ pub enum Script {
     FormatRange,
     AuditFormulas,
     FillRight,
+    BuildRows,
 }
 
 /// Where a sheet's formatting can be read from (see `format_source.js`).

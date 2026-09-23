@@ -32,10 +32,12 @@ Workbook and sheet default to whatever is active in Excel. \
 To review a model: read_range for values and formulas, list_names for defined names, \
 audit_formulas for rows whose formula changes across periods and numbers typed into formulas, \
 read_formats for input/formula color coding. \
-To build one: open_workbook, manage_sheet, write_range, fill_right, define_name, format_range, save_workbook. \
-For time series, write each row's first-period formula once, then fill_right across the periods. \
-Files are opened and saved only inside the workspace folder, which Excel has been granted access to once; \
-pass paths relative to it. \
+To build one: open_workbook, manage_sheet, define_name for inputs, then build_rows for each period sheet \
+(label, units, total and first-period formula per row, referring to other rows by {key}; it fills every period and formats), \
+write_range and format_range for everything else, save_workbook. \
+Files are opened and saved only inside the workspace folder; pass paths relative to it. \
+Excel asks the user once for access to any file it did not create itself, even inside the workspace, \
+so open a downloaded file once and save_workbook a copy to work from. Workbooks open with macros disabled. \
 Edits change the user's live workbook and cannot be undone with Excel's Undo; \
 write_range returns the previous contents so you can restore them.";
 
@@ -69,7 +71,7 @@ pub struct WriteRangeParams {
     pub sheet: Option<String>,
     /// Top-left cell to start writing at, e.g. "B2".
     pub start: String,
-    /// Rectangular grid of rows. Each cell is a number, string, boolean, or null (clears the cell). Strings starting with "=" are entered as formulas.
+    /// Rectangular grid of rows. Each cell is a number, string, boolean, or null (clears the cell). Strings starting with "=" are entered as formulas; other text is read as if typed ("1/0" becomes a date), so prefix ' to keep it as text.
     pub values: Vec<Vec<Value>>,
 }
 
@@ -149,6 +151,29 @@ pub struct SheetRangeParams {
     pub sheet: Option<String>,
     /// A1-style range. Defaults to the sheet's used range.
     pub range: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BuildRowsParams {
+    /// Workbook name as shown by list_workbooks. Defaults to the active workbook.
+    pub workbook: Option<String>,
+    /// Worksheet name. Defaults to the workbook's active sheet.
+    pub sheet: Option<String>,
+    /// Row where the first spec is written; specs go on consecutive rows.
+    pub start_row: u32,
+    /// Column of the first period, e.g. "E" (leave a blank spacer column before it so {prev:key} reads 0 in period 1).
+    pub first_period: String,
+    /// Column of the last period, e.g. "EG".
+    pub last_period: String,
+    /// Label column (default "A").
+    pub label_column: Option<String>,
+    /// Units column (default "B").
+    pub units_column: Option<String>,
+    /// Total/constant column (default "C").
+    pub total_column: Option<String>,
+    pub rows: Vec<crate::rows::RowSpec>,
+    /// Replace non-empty cells in the block (default false: refuse).
+    pub overwrite: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -307,7 +332,7 @@ impl<B: ExcelBridge> GridskiServer<B> {
     }
 
     #[tool(
-        description = "Open an .xlsx/.xlsm file in Excel, or create a new blank workbook when no path is given. Returns the workbook's name (use it as `workbook` in other tools) and sheets. A file that is already open is returned as is.",
+        description = "Open an .xlsx/.xlsm file in Excel, or create a new blank workbook when no path is given. Returns the workbook's name (use it as `workbook` in other tools) and sheets. A file that is already open is returned as is. Macros are disabled and external links are not updated, so neither prompts. Excel asks once for access to a file it did not create; save_workbook a copy into the workspace to avoid asking again.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true)
     )]
     async fn open_workbook(&self, Parameters(p): Parameters<OpenWorkbookParams>) -> Result<CallToolResult, McpError> {
@@ -393,6 +418,41 @@ impl<B: ExcelBridge> GridskiServer<B> {
     )]
     async fn format_range(&self, Parameters(p): Parameters<FormatRangeParams>) -> Result<CallToolResult, McpError> {
         respond(self.bridge.call::<_, Value>(Script::FormatRange, &p).await)
+    }
+
+    #[tool(
+        description = "Build a block of time-series rows in one call: per row a label, units, a total/constant cell, and a first-period formula that is copied across every period to last_period (relative references adjust, like Fill Right), plus number_format and style (header, total, link, input). Rows refer to each other by key: {key} = that row in the same period, {prev:key} = previous period (e.g. opening = {prev:close}), {row:key} = the row's whole period range (for totals: =SUM({row:rent})), {total:key} = its total cell. Other sheets are referenced directly, e.g. Timing!E$9 in the first period. Refuses to write over non-empty cells unless overwrite is true. Returns each key's row number.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true)
+    )]
+    async fn build_rows(&self, Parameters(p): Parameters<BuildRowsParams>) -> Result<CallToolResult, McpError> {
+        let col = |c: &Option<String>, default: &str| crate::rows::column(c.as_deref().unwrap_or(default));
+        let layout = (|| {
+            Ok::<_, String>(crate::rows::Layout {
+                start_row: p.start_row.max(1),
+                label_col: col(&p.label_column, "A")?,
+                units_col: col(&p.units_column, "B")?,
+                total_col: col(&p.total_column, "C")?,
+                first_col: crate::rows::column(&p.first_period)?,
+                last_col: crate::rows::column(&p.last_period)?,
+            })
+        })();
+        let plan = match layout.and_then(|l| crate::rows::plan(&l, &p.rows)) {
+            Ok(plan) => plan,
+            Err(e) => return respond::<()>(Err(BridgeError::InvalidInput(e))),
+        };
+        let args = serde_json::json!({
+            "workbook": p.workbook,
+            "sheet": p.sheet,
+            "overwrite": p.overwrite.unwrap_or(false),
+            "target": plan.target,
+            "head_start": plan.head_start,
+            "head": plan.head,
+            "fill": plan.fill,
+            "first_col": plan.first_col,
+            "formats": plan.formats,
+            "keys": plan.keys,
+        });
+        respond(self.bridge.call::<_, Value>(Script::BuildRows, &args).await)
     }
 
     #[tool(

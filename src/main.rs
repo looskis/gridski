@@ -2,6 +2,7 @@ mod audit;
 mod bridge;
 mod cells;
 mod formats;
+mod rows;
 mod server;
 mod xlsx;
 
