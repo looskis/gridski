@@ -35,6 +35,7 @@ impl Script {
             Script::AuditFormulas => include_str!("scripts/audit_formulas.js"),
             Script::FillRight => include_str!("scripts/fill_right.js"),
             Script::BuildRows => include_str!("scripts/build_rows.js"),
+            Script::Calculation => include_str!("scripts/calculation.js"),
         }
     }
 }

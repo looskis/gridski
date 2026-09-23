@@ -131,6 +131,7 @@ pub enum Script {
     AuditFormulas,
     FillRight,
     BuildRows,
+    Calculation,
 }
 
 /// Where a sheet's formatting can be read from (see `format_source.js`).

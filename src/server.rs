@@ -146,6 +146,29 @@ pub struct SheetRangeParams {
     pub range: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CalcMode {
+    Automatic,
+    Manual,
+    Semiautomatic,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CalculationParams {
+    /// Calculation mode; leave unset to keep the current one.
+    pub mode: Option<CalcMode>,
+    /// Resolve circular references by iterating. A model with deliberate circularity
+    /// (interest on average balances) needs this on, or Excel warns instead of solving.
+    pub iterative: Option<bool>,
+    /// Iterations per calculation (Excel's default is 100).
+    pub max_iterations: Option<i32>,
+    /// Stop when every value moves less than this (Excel's default is 0.001).
+    pub max_change: Option<f64>,
+    /// Force a full recalculation of all open workbooks.
+    pub recalculate: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BuildRowsParams {
     /// Workbook name as shown by list_workbooks. Defaults to the active workbook.
@@ -411,6 +434,14 @@ impl<B: ExcelBridge> GridskiServer<B> {
     )]
     async fn format_range(&self, Parameters(p): Parameters<FormatRangeParams>) -> Result<CallToolResult, McpError> {
         respond(self.bridge.call::<_, Value>(Script::FormatRange, &p).await)
+    }
+
+    #[tool(
+        description = "Read or change Excel's calculation settings, which are application-wide: mode (automatic/manual/semiautomatic), iterative calculation for circular references with its iteration and change limits, and recalculate to force a full recalculation. Pass nothing to read the current settings. Turn iterative on before building a model whose circularity is deliberate (interest on average balances); it is off by default and Excel then shows a circular-reference warning instead of solving.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true)
+    )]
+    async fn calculation(&self, Parameters(p): Parameters<CalculationParams>) -> Result<CallToolResult, McpError> {
+        respond(self.bridge.call::<_, Value>(Script::Calculation, &p).await)
     }
 
     #[tool(

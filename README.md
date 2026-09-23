@@ -22,6 +22,7 @@ It talks to the running Excel app through Apple Events (JavaScript for Automatio
 | `define_name` | Create, change, or remove a workbook-level name |
 | `build_rows` | Build a period sheet's rows in one call: label, units, total, and a first-period formula filled across all periods; rows refer to each other by `{key}`; styles and number formats applied |
 | `fill_right` | Copy each row's first cell across a range, like Excel's Fill Right; for time-series rows |
+| `calculation` | Read or set calculation mode, iterative calculation for circular models, and force a recalc |
 | `format_range` | Set font color, bold/italic, fill, number format, alignment, indent, column width, and borders |
 
 ## Skill
