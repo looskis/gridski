@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/gridski-icon.png" alt="gridski logo" width="128" height="128">
+</p>
+
 # gridski
 
 An MCP server that lets AI assistants read and edit workbooks open in Microsoft Excel on macOS.
